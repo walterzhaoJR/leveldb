@@ -6,3 +6,5 @@
 # Build directory.
 build/
 out/
+code/tmp/
+code/CMakeFiles
