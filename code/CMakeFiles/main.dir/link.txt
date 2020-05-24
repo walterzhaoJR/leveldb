@@ -1,1 +1,0 @@
-/usr/bin/c++     CMakeFiles/main.dir/main.cpp.o  -o main  -L/data/github/leveldb/code/../build -Wl,-rpath,/data/github/leveldb/code/../build -Wl,-Bstatic -lleveldb -Wl,-Bdynamic -lpthread 

@@ -1,3 +1,0 @@
-/data/github/leveldb/code/CMakeFiles/rebuild_cache.dir
-/data/github/leveldb/code/CMakeFiles/main.dir
-/data/github/leveldb/code/CMakeFiles/edit_cache.dir
