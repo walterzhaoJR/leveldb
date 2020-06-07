@@ -44,11 +44,11 @@ struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
       : batch(nullptr), sync(false), done(false), cv(mu) {}
 
-  Status status;
-  WriteBatch* batch;
-  bool sync;
-  bool done;
-  port::CondVar cv;
+  Status status;//本次写入的结果
+  WriteBatch* batch;//本次写入的WriteBatch
+  bool sync;//log是否要立刻同步刷到磁盘
+  bool done;//本次写入是否完成
+  port::CondVar cv;//封装的条变量
 };
 
 struct DBImpl::CompactionState {
@@ -1198,6 +1198,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   w.sync = options.sync;
   w.done = false;
 
+  //LevelDB加锁保证同一时刻只能有一个Writer工作。其他Writer挂起等待，直到前一个Writer执行完毕后唤醒。
   MutexLock l(&mutex_);
   writers_.push_back(&w);
   while (!w.done && &w != writers_.front()) {
@@ -1208,20 +1209,29 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   }
 
   // May temporarily unlock and wait.
-  Status status = MakeRoomForWrite(updates == nullptr);
-  uint64_t last_sequence = versions_->LastSequence();
-  Writer* last_writer = &w;
+  Status status = MakeRoomForWrite(updates == nullptr);//做一些写入前的check，包括如是不是该停写，是不是该切memtable，是不是该compact等
+  uint64_t last_sequence = versions_->LastSequence();//获取最大的序列号
+  Writer* last_writer = &w;// laster_writer的意思是打包多个write中的最后一个writer
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
-    WriteBatch* write_batch = BuildBatchGroup(&last_writer);
-    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
-    last_sequence += WriteBatchInternal::Count(write_batch);
+    WriteBatch* write_batch = BuildBatchGroup(&last_writer);//这个函数要拿出来，重点说一下
+    // 这里要联系到上边的 MutexLock l(&mutex_); 下边的那段代码：
+    // 合并writers里多个writer的WriteBatch，就是上面write deque里阻塞住的writer完成他们的任务
+    // 第一个进来的写操作会在真正写log文件和写memtable时候把锁放掉，
+    // 这时候别的写操作会进来把自己push到writes_的deque中，然后挂起在自己的条件锁上（ w.cv.Wait();）
+    // 为什么呢？因为此时自己的done不是true并且自己不是deque中的第一个writer，
+    // 等第一个writer全部操作完之后呢，会把此时deque中的所有writer唤醒,为什么醒了之后第一步是判断自己是不是done呢，自己还没执行怎么可能会done呢
+    // 其实这就是leveldb的优化，当前抢到锁进来的writer会在真正操作之前把此时deque中所有的writer的任务都拿过来（实际上不是全拿过来，有数量限制），
+    // 然后帮他们都做了，并且把结果放回至每个writer对应的status中，最后再唤醒所有writer，所以这些writer醒来后发现自己的任务已经被做了，就直接拿自己的返回值返回了
+
+    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);//本次写入对应的序列号
+    last_sequence += WriteBatchInternal::Count(write_batch);//更新last_sequence，加的个数等于此次是WriteBatch中操作的个数
 
     // Add to log and apply to memtable.  We can release the lock
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
     {
-      mutex_.Unlock();
+      mutex_.Unlock();//写log和写memtable时可以放锁，让别的write进入deque，以减少互斥时间
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1233,7 +1243,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       if (status.ok()) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
-      mutex_.Lock();
+      mutex_.Lock();//再次加锁，互斥的更新versions的last_sequence
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
@@ -1246,6 +1256,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     versions_->SetLastSequence(last_sequence);
   }
 
+  //从deque的第一个writer开始pop，第一个writer一定是当前操作的writer，
+  //直到pop到本次打包的最后一个writer
   while (true) {
     Writer* ready = writers_.front();
     writers_.pop_front();
@@ -1258,6 +1270,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   }
 
   // Notify new head of write queue
+  //唤醒此时的deque头writer，从它开始进行接下来的写入
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
   }

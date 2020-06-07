@@ -60,6 +60,7 @@ class LEVELDB_EXPORT DB {
 
   virtual ~DB();
 
+  //以下3个函数就是写入操作的函数原型，walter
   // Set the database entry for "key" to "value".  Returns OK on success,
   // and a non-OK status on error.
   // Note: consider setting options.sync = true.
